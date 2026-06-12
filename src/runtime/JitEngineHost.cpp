@@ -22,6 +22,7 @@
 #endif
 
 #include <llvm/ExecutionEngine/JITEventListener.h>
+#include <llvm/ExecutionEngine/JITLink/JITLinkMemoryManager.h>
 #include <llvm/ExecutionEngine/Orc/Core.h>
 #include <llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h>
 #include <llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h>
@@ -285,8 +286,10 @@ std::unique_ptr<MemoryBuffer> JitEngineHost::compileOnly(Module &M,
   TIMESCOPE(JitEngineHost, compileOnly);
   // Create the target machine using JITTargetMachineBuilder to match ORC JIT
   // loading.
-  auto ExpectedTM =
-      JITTargetMachineBuilder::detectHost()->createTargetMachine();
+  auto ExpectedJTMB = JITTargetMachineBuilder::detectHost();
+  if (auto E = ExpectedJTMB.takeError())
+    reportFatalError("detectHost failed: " + toString(std::move(E)));
+  auto ExpectedTM = ExpectedJTMB->createTargetMachine();
   if (auto E = ExpectedTM.takeError())
     reportFatalError("Expected target machine: " + toString(std::move(E)));
   std::unique_ptr<TargetMachine> TM = std::move(*ExpectedTM);
@@ -377,7 +380,34 @@ JitEngineHost::JitEngineHost() {
   // By dumpSymbolInfo() the debug sections are not populated. Why?
   LLJITPtr = ExitOnErr(
       LLJITBuilder()
-#if LLVM_VERSION_MAJOR >= 22
+#if LLVM_VERSION_MAJOR >= 23
+          // LLVM >= 23: ObjectLinkingLayerCreator takes (ExecutionSession &,
+          // jitlink::JITLinkMemoryManager &) and must return
+          // Expected<std::unique_ptr<ObjectLayer>>.
+          .setObjectLinkingLayerCreator(
+              [&](ExecutionSession &ES,
+                  jitlink::JITLinkMemoryManager &) -> Expected<std::unique_ptr<ObjectLayer>> {
+                auto GetMemMgr = [](const MemoryBuffer &) {
+                  return std::make_unique<SectionMemoryManager>();
+                };
+                auto ObjLinkingLayer =
+                    std::make_unique<RTDyldObjectLinkingLayer>(ES, GetMemMgr);
+
+                // Register the event listener.
+                ObjLinkingLayer->registerJITEventListener(
+                    *JITEventListener::createGDBRegistrationListener());
+
+                // Make sure the debug info sections aren't stripped.
+                ObjLinkingLayer->setProcessAllSections(true);
+
+                if (Config::get().ProteusDebugOutput) {
+                  ObjLinkingLayer->setNotifyLoaded(notifyLoaded);
+                }
+                return ObjLinkingLayer;
+              })
+#elif LLVM_VERSION_MAJOR >= 22
+          // LLVM 22: ObjectLinkingLayerCreator takes only (ExecutionSession &)
+          // and returns std::unique_ptr<ObjectLayer> directly.
           .setObjectLinkingLayerCreator([&](ExecutionSession &ES) {
             auto GetMemMgr = [](const MemoryBuffer &) {
               return std::make_unique<SectionMemoryManager>();
@@ -398,6 +428,8 @@ JitEngineHost::JitEngineHost() {
             return ObjLinkingLayer;
           })
 #else
+          // LLVM < 22: ObjectLinkingLayerCreator takes (ExecutionSession &,
+          // const Triple &).
           .setObjectLinkingLayerCreator(
               [&](ExecutionSession &ES, const Triple &) {
                 auto GetMemMgr = []() {

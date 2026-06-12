@@ -158,12 +158,14 @@ inline void runOptimizationPassPipeline(Module &M, StringRef Arch,
   case '3':
     OptSetting = OptimizationLevel::O3;
     break;
+  # if LLVM_VERSION_MAJOR < 23
   case 's':
     OptSetting = OptimizationLevel::Os;
     break;
   case 'z':
     OptSetting = OptimizationLevel::Oz;
     break;
+  # endif /* LLVM_VERSION_MAJOR */
   default:
     reportFatalError(std::string("Unsupported optimization level ") + OptLevel);
   };
